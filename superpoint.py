@@ -1,7 +1,6 @@
 import torch
 import cv2
 import numpy as np
-import glob
 
 # Stub to warn about opencv version.
 if int(cv2.__version__[0]) < 3:  # pragma: no cover
