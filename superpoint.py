@@ -1,3 +1,4 @@
+from mimetypes import init
 import torch
 import cv2
 import numpy as np
@@ -82,14 +83,15 @@ class SuperPointNet(torch.nn.Module):
 class SuperPointFrontend(object):
     """Wrapper around pytorch net to help with pre and post image processing."""
 
-    def __init__(self, weights_path, nms_dist, conf_thresh, nn_thresh, cuda=False):
+    def __init__(self, weights_path, nms_dist, conf_thresh, nn_thresh, num_kp_point=20,cuda=False):
         self.name = "SuperPoint"
         self.cuda = cuda
         self.nms_dist = nms_dist
         self.conf_thresh = conf_thresh
         self.nn_thresh = nn_thresh  # L2 descriptor distance for good match.
         self.cell = 8  # Size of each output cell. Keep this fixed.
-        self.border_remove = 4  # Remove points this close to the border.
+        self.border_remove = 10  # Remove points this close to the border.
+        self.num_kp_point=num_kp_point
 
         # Load the network in inference mode.
         self.net = SuperPointNet()
@@ -204,14 +206,35 @@ class SuperPointFrontend(object):
         heatmap = np.reshape(nodust, [Hc, Wc, self.cell, self.cell])
         heatmap = np.transpose(heatmap, [0, 2, 1, 3])
         heatmap = np.reshape(heatmap, [Hc * self.cell, Wc * self.cell])
-        xs, ys = np.where(heatmap >= self.conf_thresh)  # Confidence threshold.
+        
+        def is_topk(a, k = 1):
+            _, rix = np.unique(-a, return_inverse = True)
+            return np.where(rix < k, 1, 0).reshape(a.shape)
+        heatmap_filter=is_topk(heatmap,self.num_kp_point)
+        xs, ys = np.where(heatmap_filter > 0)
+        
+        # xs, ys = np.where(heatmap >= self.conf_thresh)  # Confidence threshold.
+        
+        # pts_set=set()
+        # ys=[]
+        # xs=[]
+        # for x_idx in range(heatmap.shape[0]):
+        #     for y_idx in range(heatmap.shape[1]):
+        #         if heatmap[x_idx][y_idx] >= self.conf_thresh:
+        #             for x_delta in [-1,0,1]:
+        #                 for y_delta in [-1,0,1]:
+        #                     if (x_idx+x_delta,y_idx+y_delta) not in pts_set:
+        #                         pts_set.add((x_idx+x_delta,y_idx+y_delta))
+        #                         ys.append(y_idx+y_delta)
+        #                         xs.append(x_idx+x_delta)
+        
         if len(xs) == 0:
             return np.zeros((3, 0)), None, None
         pts = np.zeros((3, len(xs)))  # Populate point data sized 3xN.
         pts[0, :] = ys
         pts[1, :] = xs
         pts[2, :] = heatmap[xs, ys]
-        pts, _ = self.nms_fast(pts, H, W, dist_thresh=self.nms_dist)  # Apply NMS.
+        # pts, _ = self.nms_fast(pts, H, W, dist_thresh=self.nms_dist)  # Apply NMS.
         inds = np.argsort(pts[2, :])
         pts = pts[:, inds[::-1]]  # Sort by confidence.
         # Remove points along border.
@@ -288,12 +311,16 @@ class PointTracker(object):
         # Get NN indices and scores.
         idx = np.argmin(dmat, axis=1)
         scores = dmat[np.arange(dmat.shape[0]), idx]
-        # Threshold the NN matches.
+        
+        # Threshold the NN matches, 0<scores<4.
         keep = scores < nn_thresh
+        
+        # chenning: remove the bidirection check
         # Check if nearest neighbor goes both directions and keep those.
-        idx2 = np.argmin(dmat, axis=0)
-        keep_bi = np.arange(len(idx)) == idx2[idx]
-        keep = np.logical_and(keep, keep_bi)
+        # idx2 = np.argmin(dmat, axis=0)
+        # keep_bi = np.arange(len(idx)) == idx2[idx]
+        # keep = np.logical_and(keep, keep_bi)
+        
         idx = idx[keep]
         scores = scores[keep]
         # Get the surviving point indices.
@@ -334,7 +361,9 @@ class PointTracker(object):
             return
         assert pts.shape[1] == desc.shape[1]
         # Initialize last_desc.
+        initilize=False
         if self.last_desc is None:
+            initilize=True
             self.last_desc = np.zeros((desc.shape[0], 0))
         # Remove oldest points, store its size to update ids later.
         remove_size = self.all_pts[0].shape[1]
@@ -359,39 +388,43 @@ class PointTracker(object):
             found = np.argwhere(self.tracks[:, -2] == id1)
             if found.shape[0] > 0:
                 matched[int(match[1])] = True
-                row = int(found)
-                self.tracks[row, -1] = id2
-                if self.tracks[row, 1] == self.max_score:
-                    # Initialize track score.
-                    self.tracks[row, 1] = match[2]
-                else:
-                    # Update track score with running average.
-                    # NOTE(dd): this running average can contain scores from old matches
-                    #           not contained in last max_length track points.
-                    track_len = (self.tracks[row, 2:] != -1).sum() - 1.0
-                    frac = 1.0 / float(track_len)
-                    self.tracks[row, 1] = (1.0 - frac) * self.tracks[
-                        row, 1
-                    ] + frac * match[2]
+                for found_idx in range(found.shape[0]):
+                    row = int(found[found_idx])
+                    self.tracks[row, -1] = id2
+                    if self.tracks[row, 1] == self.max_score:
+                        # Initialize track score.
+                        self.tracks[row, 1] = match[2]
+                    else:
+                        # Update track score with running average.
+                        # NOTE(dd): this running average can contain scores from old matches
+                        #           not contained in last max_length track points.
+                        track_len = (self.tracks[row, 2:] != -1).sum() - 1.0
+                        frac = 1.0 / float(track_len)
+                        self.tracks[row, 1] = (1.0 - frac) * self.tracks[
+                            row, 1
+                        ] + frac * match[2]
+        # chenning: do not add new ids from the second frame
         # Add unmatched tracks.
-        new_ids = np.arange(pts.shape[1]) + offsets[-1]
-        new_ids = new_ids[~matched]
-        new_tracks = -1 * np.ones((new_ids.shape[0], self.maxl + 2))
-        new_tracks[:, -1] = new_ids
-        new_num = new_ids.shape[0]
-        new_trackids = self.track_count + np.arange(new_num)
-        new_tracks[:, 0] = new_trackids
-        new_tracks[:, 1] = self.max_score * np.ones(new_ids.shape[0])
-        self.tracks = np.vstack((self.tracks, new_tracks))
-        self.track_count += new_num  # Update the track count.
-        # Remove empty tracks.
-        keep_rows = np.any(self.tracks[:, 2:] >= 0, axis=1)
-        self.tracks = self.tracks[keep_rows, :]
+        if initilize:
+            new_ids = np.arange(pts.shape[1]) + offsets[-1]
+            new_ids = new_ids[~matched]
+            new_tracks = -1 * np.ones((new_ids.shape[0], self.maxl + 2))
+            new_tracks[:, -1] = new_ids
+            new_num = new_ids.shape[0]
+            new_trackids = self.track_count + np.arange(new_num)
+            new_tracks[:, 0] = new_trackids
+            new_tracks[:, 1] = self.max_score * np.ones(new_ids.shape[0])
+            self.tracks = np.vstack((self.tracks, new_tracks))
+            self.track_count += new_num  # Update the track count.
+            # Remove empty tracks.
+            keep_rows = np.any(self.tracks[:, 2:] >= 0, axis=1)
+            self.tracks = self.tracks[keep_rows, :]
+        
         # Store the last descriptors.
         self.last_desc = desc.copy()
         return
 
-    def get_tracks(self, min_length):
+    def get_tracks(self, min_length,frame_idx):
         """Retrieve point tracks of a given minimum length.
         Input
           min_length - integer >= 1 with minimum track length
@@ -407,7 +440,23 @@ class PointTracker(object):
         not_headless = self.tracks[:, -1] != -1
         keepers = np.logical_and.reduce((valid, good_len, not_headless))
         returned_tracks = self.tracks[keepers, :].copy()
-        return returned_tracks
+        
+        # chenning: retrieve the tracks in the format of optical-flow methods
+        tracks=self.tracks[:, -frame_idx:]
+        trajs=-np.ones((frame_idx, tracks.shape[0], 2))
+        pts_mem = self.all_pts[-frame_idx:]
+        offsets = self.get_offsets()
+        offsets=offsets[-frame_idx:]
+        for track_idx,track in enumerate(tracks):
+            for i in range(frame_idx):
+                if track[i] == -1:
+                    continue
+                offset = offsets[i]
+                idx = int(track[i] - offset)
+                pt1 = pts_mem[i][:2, idx]
+                p1 = [int(round(pt1[0])), int(round(pt1[1]))]
+                trajs[i,track_idx]=p1
+        return trajs
 
     def draw_tracks(self, out, tracks):
         """Visualize tracks all overlayed on a single image.
